@@ -28,7 +28,8 @@ def _saslname_decode(b):
             lhs += b'='
         else: 
             # Don't allow other sequences from QP.
-            raise ValueError('Incorrectly encoded "saslname"')
+            raise error('invalid-username-encoding',
+                        'Incorrectly encoded "saslname"')
         (l, s, rhs) = rhs[2:].partition(b'=')
         lhs += l
     return lhs
@@ -40,11 +41,14 @@ def _saslname_encode(b):
 
 def _splitmessage(msg):
     assert isinstance(msg, bytes)
+    if msg == b'':
+        return []
     parts = msg.split(b',')
     attributes = []
     for part in parts:
         if part == b'':
             attributes.append( None )
+            continue
         elif part[1] != b'=':
             raise ValueError('attr-val syntax (rfc5802 7)')
         name = part[0]
@@ -62,15 +66,22 @@ def _splitmessage(msg):
 
 def _checkmessage(unchecked, items):
     # Mandatory extensions. We don't support any.
-    if unchecked and unchecked[0][0] == 'm':
-        raise error('Unsupported extension %r' % (unchecked[0][1],))
+    if unchecked and unchecked[0] and unchecked[0][0] == 'm':
+        raise error('extensions-not-supported',
+                    'Unsupported extension %r' % (unchecked[0][1],))
 
     attributes = []
     for i in items:
-        (k, v) = unchecked.pop(0)
+        if not unchecked:
+            raise ValueError('Missing field, expecting %r' % (i,))
+        u = unchecked.pop(0)
+        if u is None:
+            raise ValueError('Empty field, expecting %r' % (i,))
+        (k, v) = u
         if k != i:
-            raise error('Unexpected field %r, expecting %r' % (k, i))
+            raise ValueError('Unexpected field %r, expecting %r' % (k, i))
         attributes.append(v)
+    # Anything left in "unchecked" is an optional extension.
     return ( attributes, unchecked )
 
 def PBKDF2_mini(password, salt, iterations, hashfunc):
@@ -141,12 +152,12 @@ class Scram(sasl.mechanism.Mechanism):
         return nonce
 
     def prepare_names(self):
-        authn = auth.username()
-        authz = auth.authorization_id()
+        authn = self.auth.username()
+        authz = self.auth.authorization_id()
         if authz == authn or authz == u'':
             authz = None
         
-        prep = sasl.stringprep.prepare
+        prep = sasl.stringprep.saslprep
         self.authn_prepped = _saslname_encode(prep(authn).encode('utf-8'))
         if authz is not None:
             self.authz_prepped = _saslname_encode(prep(authz).encode('utf-8'))
@@ -154,7 +165,7 @@ class Scram(sasl.mechanism.Mechanism):
             self.authz_prepped = None
 
     def salt_key(self, password, salt, iterations):
-        normpass = sasl.stringprep.prepare(password).encode('utf-8')
+        normpass = sasl.stringprep.saslprep(password).encode('utf-8')
         return PBKDF2_mini(normpass, salt, iterations, self.hashfunc)
     def derive_client_keys(self, saltedpassword,
                            clientkey=None, serverkey=None,
@@ -177,6 +188,13 @@ class Scram(sasl.mechanism.Mechanism):
         if self._logger is None:
             self._logger = logging.getLogger(__name__)
         return self._logger
+    def reportexc(self, ctxt, exc):
+        self.logger().error('%s: %r' % (ctxt, exc), exc_info=True)
+        if isinstance(exc, error):
+            errstr = exc.args[0].encode('ascii')
+        else:
+            errstr = b'other-error'
+        return AuthState(False, None, b'e='+errstr)            
 
     ## Client:
     ## 1. Issue IR with username and cbinding flag.
@@ -286,8 +304,7 @@ class Scram(sasl.mechanism.Mechanism):
             info = _checkmessage(_splitmessage(first_message_bare), b'nr')
             ( authnid, cnonce ) = info[0]
         except Exception, e:
-            self.logger().error('client message parse error: %r' % (e,))
-            return AuthState(False, None, b'e=other-error')
+            return self.reportexc('parsing initial client message', e)
 
         # Make sure the client is using the expected nonce.
         if len(cnonce) < self.minimum_nonce:
@@ -318,9 +335,9 @@ class Scram(sasl.mechanism.Mechanism):
         
         # Check that the usernames are valid.
         try:
-            username = sasl.stringprep.prepare(authnid.decode('utf-8'))
+            username = sasl.stringprep.saslprep(authnid.decode('utf-8'))
             if authzid is not None:
-                authzname = sasl.stringprep.prepare(authzid.decode('utf-8'))
+                authzname = sasl.stringprep.saslprep(authzid.decode('utf-8'))
             else:
                 authzname = None
             
@@ -335,8 +352,8 @@ class Scram(sasl.mechanism.Mechanism):
             self.logger().error('client invalid-username-encoding: %r' % (e,))
             return AuthState(False, None, b'e=invalid-username-encoding')
         except Exception, e:
-            self.logger().error('error retrieving user: %r' % (e,))
-            return AuthState(False, None, b'e=other-error')
+            return self.reportexc('retrieving user', e)
+
 
         nonce = cnonce + self.generate_nonce()
         response = b'r=%s,s=%s,i=%d' % ( nonce, b64encode(salt), its )
@@ -361,8 +378,7 @@ class Scram(sasl.mechanism.Mechanism):
             ( ( cbinding_again, nonce_again ), extensions ) = \
                 _checkmessage(_splitmessage(without_proof), b'cr')
         except Exception, e:
-            self.logger().error('while parsing client response: %r', e)
-            return AuthState(False, None, b'e=other-error')
+            return self.reportexc('parsing client response', e)
 
         if nonce_again != nonce:
             self.logger().error('client nonce mismatch')
@@ -405,8 +421,9 @@ class Scram(sasl.mechanism.Mechanism):
             # This is the example entry from RFC 5802.
             salt = b64decode('QSXCR+Q6sek8bf92')
             iterations = 4096
-            ( cl, se, sk ) = self.derive_client_keys(self.salt_key(u'pencil', salt, iterations))
-            return ( sk, se, salt, iterations )
+            ( _, serverkey, storedkey ) = self.derive_client_keys(self.salt_key(u'pencil', salt, iterations))
+            return ( storedkey, serverkey, salt, iterations )
+        raise error('unknown-user')
         
 class ScramSHA1(Scram):
     hashfunc = hashlib.sha1

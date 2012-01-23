@@ -9,10 +9,11 @@ mechanisms_ are:
 
 * PLAIN_
 * `DIGEST-MD5`_
+* `SCRAM-*`_ (in progress)
 
 .. _SASL: http://tools.ietf.org/html/rfc2222
 .. _mechanisms: http://www.iana.org/assignments/sasl-mechanisms
 .. _PLAIN: http://www.ietf.org/rfc/rfc4616.txt
 .. _`DIGEST-MD5`: http://www.ietf.org/rfc/rfc2831.txt
-
+.. _`SCRAM-*`: http://www.ietf.org/rfc/rfc5802.txt
 
